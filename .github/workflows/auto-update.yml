@@ -1,0 +1,125 @@
+name: Auto-update upstream (guan-ry)
+
+# 自动同步上游 guan-ry/FanControlServerApp 到本 fork 的 main：
+#   - 读取上游 main 分支 manifest 的 version（上游用 manifest 版本，无独立 VERSION 文件）
+#   - 与本地 manifest 比较，若更高：合并上游 → 确保 distributor=yunchui → bump manifest version → commit & push
+#   - 打 v<VERSION> tag，触发 release.yml 构建 FPK 并发布
+on:
+  schedule:
+    - cron: '35 3 * * *'   # 每天 UTC 03:35（北京 11:35）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_PAT_TOKEN }}
+          ref: main
+          fetch-depth: 0
+
+      - name: Detect upstream version
+        id: detect
+        run: |
+          # 读上游 main 的 manifest version（上游以 manifest 为版本源）
+          UP_VERSION="$(curl -fsSL --max-time 30 \
+            "https://raw.githubusercontent.com/guan-ry/FanControlServerApp/main/manifest" \
+            | sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' | tr -d '[:space:]')"
+          LOCAL_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' manifest | tr -d '[:space:]')"
+          echo "upstream=$UP_VERSION local=$LOCAL_VERSION"
+          echo "upstream_version=${UP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "local_version=${LOCAL_VERSION}" >> "$GITHUB_OUTPUT"
+          if [ -z "$UP_VERSION" ]; then
+            echo "::error:: 无法读取上游 manifest version"
+            exit 1
+          fi
+          # 版本比较：纯 POSIX shell，逐段 %06d 数字化（适配 1.3.7.1 四段）
+          newer() {
+            a="$1"; b="$2"
+            _v() {
+              local s="$1" out="" p
+              s="${s#v}"
+              IFS='.' read -r -a parts <<< "${s}"
+              for p in "${parts[@]}"; do out="${out}$(printf '%06d' "${p:-0}")"; done
+              echo "${out}"
+            }
+            local va vb
+            va="$(_v "$a")"; vb="$(_v "$b")"
+            [ "$va" -gt "$vb" ]
+          }
+          if [ "$UP_VERSION" != "$LOCAL_VERSION" ] && newer "$UP_VERSION" "$LOCAL_VERSION"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "new upstream version ${UP_VERSION}"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "no update (local=${LOCAL_VERSION} upstream=${UP_VERSION})"
+          fi
+
+      - name: Merge upstream and bump
+        id: merge
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_PAT_TOKEN }}
+        run: |
+          git config user.name "yunchui"
+          git config user.email "yunchui@users.noreply.github.com"
+          git remote add upstream "https://x-access-token:${GITHUB_TOKEN}@github.com/guan-ry/FanControlServerApp.git"
+          git fetch upstream main:upstream-main
+          # 上游为准合并（-X theirs）；失败兜底整体覆盖（保留本 fork workflows/scripts）
+          if git merge --no-edit -X theirs upstream-main 2>/dev/null; then
+            echo "merge ok (-X theirs)"
+          else
+            echo "merge 冲突，改用上游树整体覆盖"
+            git merge --abort 2>/dev/null || true
+            cp -r .github /tmp/fork_github 2>/dev/null || true
+            cp -r scripts /tmp/fork_scripts 2>/dev/null || true
+            git read-tree --reset -u upstream-main 2>/dev/null || { git rm -rf . && git read-tree --reset -u upstream-main; }
+            mkdir -p .github scripts
+            cp -r /tmp/fork_github/. .github/ 2>/dev/null || true
+            cp -r /tmp/fork_scripts/. scripts/ 2>/dev/null || true
+            git add -A
+          fi
+          # bump manifest version
+          UP_VERSION="${{ steps.detect.outputs.upstream_version }}"
+          sed -i "s/^[[:space:]]*version[[:space:]]*=.*/version               = ${UP_VERSION}/" manifest
+          # 确保 distributor=yunchui（脚本化，避免 workflow 内嵌 heredoc）
+          python3 scripts/ensure-distributor.py manifest
+          git add manifest
+          if git diff --cached --quiet; then
+            echo "merged but no version change (unexpected)"
+          else
+            git commit -m "chore: 同步上游 guan-ry → ${UP_VERSION}（自动）"
+          fi
+          echo "version=${UP_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Push main
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_PAT_TOKEN }}
+        run: |
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/yunchui/FanControlServerApp.git" main
+
+      - name: Create tag
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_PAT_TOKEN }}
+        run: |
+          cd "${GITHUB_WORKSPACE}"
+          git fetch --tags origin
+          TAG="v${{ steps.merge.outputs.version }}"
+          if ! git tag -l "$TAG" | grep -q .; then
+            git tag "$TAG"
+            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/yunchui/FanControlServerApp.git" "$TAG"
+            echo "tagged $TAG"
+          else
+            echo "tag $TAG already exists, skip"
+          fi
+
+      - name: No update
+        if: steps.detect.outputs.changed == 'false'
+        run: echo "上游无新版本，跳过同步"

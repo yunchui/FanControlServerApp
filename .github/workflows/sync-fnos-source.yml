@@ -1,0 +1,63 @@
+name: Sync FanControlServer to fnos-source
+
+# FanControlServer 发布新 GitHub Release 后，自动更新 yunchui/fnos-source
+# 中 FanControlServer 条目的版本/sha256/size/download_url（取 url 变体 FPK）。
+# 需要 MY_PAT_TOKEN secret（对 fnos-source 有写权限）。
+
+on:
+  release:
+    types: [published]
+  workflow_run:
+    workflows: ["CI/CD - Build and Release"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    if: github.repository == 'yunchui/FanControlServerApp'
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_PAT_TOKEN }}
+          fetch-depth: 1
+
+      - name: Checkout fnos-source
+        uses: actions/checkout@v4
+        with:
+          repository: yunchui/fnos-source
+          token: ${{ secrets.MY_PAT_TOKEN }}
+          path: source
+
+      - name: Read latest release info (url variant)
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ -n "$TAG" ] && [ "$TAG" != "main" ] && [ "$TAG" != "master" ]; then
+            python3 scripts/read-release.py "${TAG}"
+          else
+            python3 scripts/read-release.py
+          fi
+
+      - name: Update fnpack.json (fnos-source)
+        run: |
+          python3 scripts/update-fnpack.py source/fnpack.json /tmp/fcs_release.json
+
+      - name: Commit and push to fnos-source
+        run: |
+          cd source
+          if git diff --quiet; then
+            echo "无变更，跳过提交"; exit 0
+          fi
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add fnpack.json
+          git commit -m "🤖 同步 FanControlServer 至 $(python3 -c 'import json;print(json.load(open(\"/tmp/fcs_release.json\"))[\"version\"])')"
+          git push "https://x-access-token:${MY_PAT_TOKEN}@github.com/yunchui/fnos-source.git" HEAD:main
+        env:
+          MY_PAT_TOKEN: ${{ secrets.MY_PAT_TOKEN }}
